@@ -841,7 +841,9 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.isIdle()) {
 			startTypingLoop(ctx, turn.chatId);
 			updateStatus(ctx);
-			pi.sendUserMessage(turn.content);
+			// MicroVAC patch 10-13 (re-applied 10-14: lost in upstream update):
+			// bare sendUserMessage throws "Agent is already processing" mid-run.
+			pi.sendUserMessage(turn.content, { deliverAs: "followUp" });
 		}
 	}
 
@@ -1023,6 +1025,12 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		config = await readConfig();
 		await mkdir(TEMP_DIR, { recursive: true });
+		// MicroVAC patch 2026-09-15 (re-applied 10-14: lost when the checkout
+		// updated 10-13 21:13): auto-connect the central session on every
+		// (re)start so the Telegram bridge survives /reload and pi restarts.
+		if (config.botToken && !pollingPromise) {
+			await startPolling(ctx);
+		}
 		updateStatus(ctx);
 	});
 
@@ -1086,7 +1094,18 @@ export default function (pi: ExtensionAPI) {
 		stopTypingLoop();
 		activeTelegramTurn = undefined;
 		updateStatus(ctx);
-		if (!turn) return;
+		if (!turn) {
+			// MicroVAC patch 10-13 (re-applied 10-14): a Telegram message queued during
+			// a NON-Telegram run (TUI/heartbeat) would never drain, because the drain
+			// below only runs when the finished run was itself a Telegram turn.
+			if (queuedTelegramTurns.length > 0 && !preserveQueuedTurnsAsHistory) {
+				const nextTurn = queuedTelegramTurns[0];
+				startTypingLoop(ctx, nextTurn.chatId);
+				updateStatus(ctx);
+				pi.sendUserMessage(nextTurn.content, { deliverAs: "followUp" });
+			}
+			return;
+		}
 
 		const assistant = extractAssistantText(event.messages);
 		if (assistant.stopReason === "aborted") {
@@ -1124,7 +1143,7 @@ export default function (pi: ExtensionAPI) {
 			const nextTurn = queuedTelegramTurns[0];
 			startTypingLoop(ctx, nextTurn.chatId);
 			updateStatus(ctx);
-			pi.sendUserMessage(nextTurn.content);
+			pi.sendUserMessage(nextTurn.content, { deliverAs: "followUp" });
 		}
 	});
 }
