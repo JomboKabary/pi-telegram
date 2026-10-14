@@ -1,4 +1,4 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile, appendFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -13,6 +13,7 @@ interface TelegramConfig {
 	botId?: number;
 	allowedUserId?: number;
 	lastUpdateId?: number;
+	lastChatId?: number; // MicroVAC 10-14: reply target for attach fallback
 }
 
 interface TelegramApiResponse<T> {
@@ -518,21 +519,21 @@ export default function (pi: ExtensionAPI) {
 		return lastMessageId;
 	}
 
+	async function sendFileTo(chatId: number, path: string, fileName: string): Promise<void> {
+		// MicroVAC 10-14: shared sender; .ogg/.opus ride as playable voice notes.
+		const mediaType = guessMediaType(path);
+		const lower = path.toLowerCase();
+		let method = "sendDocument";
+		let field = "document";
+		if (mediaType) { method = "sendPhoto"; field = "photo"; }
+		else if (lower.endsWith(".ogg") || lower.endsWith(".opus")) { method = "sendVoice"; field = "voice"; }
+		await callTelegramMultipart<TelegramSentMessage>(method, { chat_id: String(chatId) }, field, path, fileName);
+	}
+
 	async function sendQueuedAttachments(turn: ActiveTelegramTurn): Promise<void> {
 		for (const attachment of turn.queuedAttachments) {
 			try {
-				const mediaType = guessMediaType(attachment.path);
-				const method = mediaType ? "sendPhoto" : "sendDocument";
-				const fieldName = mediaType ? "photo" : "document";
-				await callTelegramMultipart<TelegramSentMessage>(
-					method,
-					{
-						chat_id: String(turn.chatId),
-					},
-					fieldName,
-					attachment.path,
-					attachment.fileName,
-				);
+				await sendFileTo(turn.chatId, attachment.path, attachment.fileName);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				await sendTextReply(turn.chatId, turn.replyToMessageId, `Failed to send attachment ${attachment.fileName}: ${message}`);
@@ -837,6 +838,12 @@ export default function (pi: ExtensionAPI) {
 		const historyTurns = preserveQueuedTurnsAsHistory ? queuedTelegramTurns.splice(0) : [];
 		preserveQueuedTurnsAsHistory = false;
 		const turn = await createTelegramTurn(messages, historyTurns);
+		// MicroVAC 10-14: remember the chat for direct-send fallback + trace decisions.
+		if (config.lastChatId !== turn.chatId) {
+			config.lastChatId = turn.chatId;
+			await writeConfig(config);
+		}
+		try { await appendFile("/tmp/telegram-steer.log", `${new Date().toISOString()} arrive idle=${ctx.isIdle()} active=${!!activeTelegramTurn} qlen=${queuedTelegramTurns.length}\n`); } catch {}
 		if (ctx.isIdle()) {
 			queuedTelegramTurns.push(turn);
 			startTypingLoop(ctx, turn.chatId);
@@ -857,7 +864,9 @@ export default function (pi: ExtensionAPI) {
 				}
 				await pi.sendUserMessage(turn.content, { deliverAs: "steer" });
 				updateStatus(ctx);
-			} catch {
+				try { await appendFile("/tmp/telegram-steer.log", `${new Date().toISOString()} STEERED ok\n`); } catch {}
+			} catch (e) {
+				try { await appendFile("/tmp/telegram-steer.log", `${new Date().toISOString()} steer THREW: ${String(e).slice(0, 120)} -> queued\n`); } catch {}
 				// not steerable at this instant — fall back to the queue;
 				// agent_start / agent_end drains will pick it up.
 				queuedTelegramTurns.push(turn);
@@ -978,6 +987,22 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params) {
 			if (!activeTelegramTurn) {
+				// MicroVAC 10-14 self-heal: steer/agent_end race can leave no active turn
+				// while Kate IS on Telegram — send directly to the last known chat.
+				const fallbackChat = config?.lastChatId;
+				if (fallbackChat) {
+					const sent: string[] = [];
+					for (const inputPath of params.paths) {
+						try {
+							await sendFileTo(fallbackChat, inputPath, basename(inputPath));
+							sent.push(inputPath);
+						} catch (e) {
+							return { content: [{ type: "text", text: `Fallback send FAILED for ${inputPath}: ${String(e).slice(0, 150)}` }], details: {} };
+						}
+					}
+					try { await appendFile("/tmp/telegram-steer.log", `${new Date().toISOString()} attach FALLBACK direct-sent ${sent.length} to ${fallbackChat}\n`); } catch {}
+					return { content: [{ type: "text", text: `Sent ${sent.length} file(s) directly to last chat (no active turn — fallback path).` }], details: { paths: sent } };
+				}
 				throw new Error("telegram_attach can only be used while replying to an active Telegram turn");
 			}
 			const added: string[] = [];
