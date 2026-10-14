@@ -837,13 +837,32 @@ export default function (pi: ExtensionAPI) {
 		const historyTurns = preserveQueuedTurnsAsHistory ? queuedTelegramTurns.splice(0) : [];
 		preserveQueuedTurnsAsHistory = false;
 		const turn = await createTelegramTurn(messages, historyTurns);
-		queuedTelegramTurns.push(turn);
 		if (ctx.isIdle()) {
+			queuedTelegramTurns.push(turn);
 			startTypingLoop(ctx, turn.chatId);
 			updateStatus(ctx);
-			// MicroVAC patch 10-13 (re-applied 10-14: lost in upstream update):
-			// bare sendUserMessage throws "Agent is already processing" mid-run.
+			// MicroVAC patch 10-13 (re-applied 10-14): bare sendUserMessage throws
+			// "Agent is already processing"; idle path starts a fresh run.
 			pi.sendUserMessage(turn.content, { deliverAs: "followUp" });
+		} else {
+			// MicroVAC 10-14 (Kate: messages must arrive on the NEXT boundary of
+			// the live run, not after the whole run ends): deliver as STEER.
+			// Reply routing: adopt the turn as active if the running turn was not
+			// a Telegram one, so my answer streams back to the phone.
+			try {
+				if (!activeTelegramTurn) {
+					activeTelegramTurn = { ...turn };
+					previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+					startTypingLoop(ctx, turn.chatId);
+				}
+				await pi.sendUserMessage(turn.content, { deliverAs: "steer" });
+				updateStatus(ctx);
+			} catch {
+				// not steerable at this instant — fall back to the queue;
+				// agent_start / agent_end drains will pick it up.
+				queuedTelegramTurns.push(turn);
+				updateStatus(ctx);
+			}
 		}
 	}
 
