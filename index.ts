@@ -351,6 +351,38 @@ export default function (pi: ExtensionAPI) {
 		return data.result;
 	}
 
+	/**
+	 * MicroVAC 10-15 22:37 crash fix, part 1 of 2. Telegram answers
+	 * 400 "Bad Request: message is not modified" when an editMessageText (or a draft
+	 * resend) carries content the server already has - reachable from the throttled
+	 * streaming preview, and from any reply longer than MAX_MESSAGE_LENGTH where two
+	 * different prefixes truncate to the same 4096 chars. That is informational, not fatal.
+	 */
+	function isNotModifiedError(error: unknown): boolean {
+		const message = error instanceof Error ? error.message : String(error);
+		return /not\s+modified/i.test(message);
+	}
+
+	function logBackgroundError(where: string, error: unknown): void {
+		const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+		try {
+			appendFileSync("/tmp/telegram-bg.log", `${new Date().toISOString()} ${where}: ${message.slice(0, 300)}\n`);
+		} catch {
+			// logging must never be the thing that breaks the bridge
+		}
+		console.error(`telegram background failure in ${where} (bridge kept alive): ${message.slice(0, 300)}`);
+	}
+
+	/**
+	 * Fire-and-forget WITH a mandatory tail. An error escaping a bare `void fn()` inside a
+	 * setTimeout / onComplete / debounce callback becomes an UNHANDLED REJECTION, and pi's
+	 * global handler exits the process on one - that is how a cosmetic Telegram 400 killed
+	 * the whole session at 22:37. Nothing in this extension may reject into the void.
+	 */
+	function fireAndLog(promise: Promise<unknown>, where: string): void {
+		Promise.resolve(promise).catch((error) => logBackgroundError(where, error));
+	}
+
 	async function callTelegramMultipart<TResponse>(
 		method: string,
 		fields: Record<string, string>,
@@ -464,7 +496,12 @@ export default function (pi: ExtensionAPI) {
 				state.mode = "draft";
 				state.lastSentText = truncated;
 				return;
-			} catch {
+			} catch (error) {
+				if (isNotModifiedError(error)) {
+					// draft already holds this exact text - nothing to do, and nothing to retry
+					state.lastSentText = truncated;
+					return;
+				}
 				draftSupport = "unsupported";
 			}
 		}
@@ -476,7 +513,14 @@ export default function (pi: ExtensionAPI) {
 			state.lastSentText = truncated;
 			return;
 		}
-		await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
+		try {
+			await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
+		} catch (error) {
+			if (!isNotModifiedError(error)) throw error;
+			logBackgroundError("flushPreview.editMessageText", error); // once per turn is enough signal
+		}
+		// Whether the server edited or told us "not modified", our view of reality is the same:
+		// this text is what Kate is looking at. Recording it here is what stops a repeat 400.
 		state.mode = "message";
 		state.lastSentText = truncated;
 	}
@@ -484,7 +528,7 @@ export default function (pi: ExtensionAPI) {
 	function schedulePreviewFlush(chatId: number): void {
 		if (!previewState || previewState.flushTimer) return;
 		previewState.flushTimer = setTimeout(() => {
-			void flushPreview(chatId);
+			fireAndLog(flushPreview(chatId), "schedulePreviewFlush"); // was: void flushPreview() -> killed pi 22:37
 		}, PREVIEW_THROTTLE_MS);
 	}
 
@@ -763,11 +807,11 @@ export default function (pi: ExtensionAPI) {
 			}
 			ctx.compact({
 				onComplete: () => {
-					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction completed.");
+					fireAndLog(sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction completed."), "compact.onComplete");
 				},
 				onError: (error) => {
 					const message = error instanceof Error ? error.message : String(error);
-					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Compaction failed: ${message}`);
+					fireAndLog(sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Compaction failed: ${message}`), "compact.onError");
 				},
 			});
 			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction started.");
@@ -885,7 +929,7 @@ export default function (pi: ExtensionAPI) {
 				const state = mediaGroups.get(key);
 				mediaGroups.delete(key);
 				if (!state) return;
-				void dispatchAuthorizedTelegramMessages(state.messages, ctx);
+				fireAndLog(dispatchAuthorizedTelegramMessages(state.messages, ctx), "mediaGroup.dispatch");
 			}, TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS);
 			mediaGroups.set(key, existing);
 			return;
